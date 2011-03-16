@@ -1,6 +1,6 @@
 name: KyotoCabinet
 version: 0.1
-license-file: BSD3
+license: BSD3
 cabal-version: >= 1.4
 copyright: (c) 2011 Warren Harris, (c) 2011 Google Inc.
 author: Warren Harris <warrenharris@google.com>

@@ -37,6 +37,7 @@ description:
     <http://fallabs.com/kyotocabinet/>
 
 category: Database
+homepage: https://code.google.com/p/kyotocabinet-hs/
 build-type: Simple
 extra-source-files:
     examples/kclangcex.hs

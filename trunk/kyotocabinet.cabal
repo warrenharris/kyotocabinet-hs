@@ -1,9 +1,11 @@
 name: KyotoCabinet
 version: 0.1
 license: BSD3
+license-file: COPYING
 cabal-version: >= 1.4
 copyright: (c) 2011 Warren Harris, (c) 2011 Google Inc.
 author: Warren Harris <warrenharris@google.com>
+maintainer: Warren Harris <warrenharris@google.com>
 stability: alpha
 synopsis: Kyoto Cabinet DB bindings
 description:
@@ -47,5 +49,5 @@ Library
                    bytestring >= 0.9
     include-dirs:  Database/KyotoCabinet/
     extra-libraries: kyotocabinet
-    ghc-options:   -O2 -Wall -threaded
+    ghc-options:   -Wall
     c-sources:     Database/KyotoCabinet/kc_hs.c

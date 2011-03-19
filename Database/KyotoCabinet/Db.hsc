@@ -46,6 +46,7 @@ module Database.KyotoCabinet.Db (
   KcDb,
   KcCur,
   KcMap,
+  KcMapIter,
   KcMapSort,
   KcError(..),
   KcTune(..),
@@ -1423,6 +1424,7 @@ foreign import ccall unsafe "kclangc.h kccuremsg" _kccuremsg
 --------------------------------------------------------------------------------
 -- KcMap
 
+-- | Memory-saving string hash map.
 newtype KcMap = KcMap { unKcMap :: ForeignPtr KCMAP } deriving (Eq)
 data KCMAP      -- native type
 
@@ -1563,6 +1565,7 @@ foreign import ccall safe "kclangc.h kcmapcount" _kcmapcount
 --------------------------------------------------------------------------------
 -- KcMapIter
 
+-- | Iterator of memory-saving string hash map.
 newtype KcMapIter = KcMapIter { unKcMapIter :: ForeignPtr KCMAPITER } deriving (Eq)
 data KCMAPITER      -- native type
 
@@ -1641,6 +1644,7 @@ foreign import ccall safe "kclangc.h kcmapiterstep" _kcmapiterstep
 --------------------------------------------------------------------------------
 -- KcMapSort
 
+-- | Sorter of memory-saving string hash map.
 newtype KcMapSort = KcMapSort { unKcMapSort :: ForeignPtr KCMAPSORT } deriving (Eq)
 data KCMAPSORT      -- native type
 
@@ -1746,9 +1750,7 @@ kcwithdbtran db hard action =
 
 -- | Brackets a map command between 'kcmapnew', and 'kcmapdel' calls.
 kcwithmap :: Int -> (KcMap -> IO a) -> IO a
-kcwithmap sz action =
-  bracketOnError (kcmapnew sz) kcmapdel
-                 (\m -> do rv <- action m; kcmapdel m; return rv)
+kcwithmap sz action = bracket (kcmapnew sz) kcmapdel action
 
 -- | Brackets a map iterator command between 'kcmapiterator' and 'kcmapiterdel' calls.
 kcwithmapiter :: KcMap -> (KcMapIter -> IO a) -> IO a

@@ -38,11 +38,15 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 -- This documentation is not a complete description of the Kyoto
 -- Cabinet DB interface.  You will need to refer to Kyoto Cabinet DB's
 -- C API documentation for the details: <http://fallabs.com/kyotocabinet/>
+--
+-- Requires Kyoto Cabinet version >= 1.2.48
 
 module Database.KyotoCabinet.Db (
   -- * Types
   KcDb,
   KcCur,
+  KcMap,
+  KcMapSort,
   KcError(..),
   KcTune(..),
   KcTuneType(..),
@@ -77,7 +81,7 @@ module Database.KyotoCabinet.Db (
   kcchkinf,
   kcecodename,
 
-  -- * DB Operations
+  -- * KcDb Operations
   kcdbnew,
   kcdbdel,
   kcdbopen,
@@ -116,7 +120,7 @@ module Database.KyotoCabinet.Db (
   kcdbmatchregex,
   kcdbmerge,
 
-  -- * Cursor Operations
+  -- * KcCur Operations
   kcdbcursor,
   kccurdel,
   kccuraccept,
@@ -134,10 +138,41 @@ module Database.KyotoCabinet.Db (
   kccurecode,
   kccuremsg,
 
+  -- * KcMap Operations
+  kcmapnew,
+  kcmapdel,
+  kcmapset,
+  kcmapadd,
+  kcmapreplace,
+  kcmapappend,
+  kcmapremove,
+  kcmapget,
+  kcmapclear,
+  kcmapcount,
+
+  -- * KcMapIter Operations
+  kcmapiterator,
+  kcmapiterdel,
+  kcmapitergetkey,
+  kcmapitergetvalue,
+  kcmapiterget,
+  kcmapiterstep,
+
+  -- * KcMapSort Operations
+  kcmapsorter,
+  kcmapsortdel,
+  kcmapsortgetkey,
+  kcmapsortgetvalue,
+  kcmapsortget,
+  kcmapsortstep,
+
   -- * Scoped Operations
   kcwithdbopen,
   kcwithdbcursor,
-  kcwithdbtran
+  kcwithdbtran,
+  kcwithmap,
+  kcwithmapiter,
+  kcwithmapsort
   ) where
 
 import Control.Applicative
@@ -213,6 +248,15 @@ bssOfCstrs (h:t) = do
   bs' <- BS.unsafePackCStringFinalizer (castPtr h) (fromIntegral hLen) (kcfree h)
   rest <- bssOfCstrs t
   return $ bs' `seq` (bs':rest)
+
+bsOfCString :: CString -> Ptr CSize -> IO (Maybe BS.ByteString)
+bsOfCString cstr szp =
+  if cstr == nullPtr then return Nothing
+  else do
+    csiz <- peek szp
+    bs <- BS.unsafePackCStringFinalizer (castPtr cstr) (fromIntegral csiz)
+          (kcfree cstr)
+    return $ Just bs
 
 --------------------------------------------------------------------------------
 -- Constants
@@ -492,6 +536,10 @@ kcThrow db fname = do
 handleBoolResult :: KcDb -> String -> CInt -> IO ()
 handleBoolResult db fname status =
   if status == 0 then kcThrow db fname else return ()
+
+handleMapBoolResult :: String -> CInt -> IO ()
+handleMapBoolResult fname status =
+  if status == 0 then throwIO (KcException fname KCEINVALID "") else return ()
 
 --------------------------------------------------------------------------------
 
@@ -892,12 +940,7 @@ kcdbget db key =
     BS.unsafeUseAsCStringLen key $ \(kbuf, ksiz) -> do
       alloca $ \ptr -> do
         cstr <- _kcdbget c_db kbuf (fromIntegral ksiz) ptr
-        if cstr == nullPtr then return Nothing
-          else do
-          csiz <- peek ptr
-          bs <- BS.unsafePackCStringFinalizer (castPtr cstr) (fromIntegral csiz)
-                  (kcfree cstr)
-          return $ Just bs
+        bsOfCString cstr ptr
 
 foreign import ccall safe "kclangc.h kcdbget" _kcdbget
   :: Ptr KCDB -> CString -> CSize -> Ptr CSize -> IO CString
@@ -1236,15 +1279,12 @@ foreign import ccall safe "kclangc.h kccurremove" _kccurremove
 -- | Get the key of the current record.
 kccurgetkey :: KcCur
             -> Bool -- ^ step
-            -> IO BS.ByteString
+            -> IO (Maybe BS.ByteString)
 kccurgetkey cur step = do
   withForeignPtr (unKcCur cur) $ \c_cur -> do
     alloca $ \ptr -> do
       cstr <- _kccurgetkey c_cur ptr (if step then 1 else 0)
-      if cstr == nullPtr then kccurdb cur >>= flip kcThrow "kccurgetkey"
-        else do
-        len <- peek ptr
-        BS.unsafePackCStringFinalizer (castPtr cstr) (fromIntegral len) (kcfree cstr)
+      bsOfCString cstr ptr
 
 foreign import ccall safe "kclangc.h kccurgetkey" _kccurgetkey
   :: Ptr KCCUR -> Ptr CSize -> CInt -> IO CString
@@ -1252,15 +1292,12 @@ foreign import ccall safe "kclangc.h kccurgetkey" _kccurgetkey
 -- | Get the value of the current record.
 kccurgetvalue :: KcCur
               -> Bool -- ^ step
-              -> IO BS.ByteString
+              -> IO (Maybe BS.ByteString)
 kccurgetvalue cur step = do
   withForeignPtr (unKcCur cur) $ \c_cur -> do
     alloca $ \ptr -> do
       cstr <- _kccurgetvalue c_cur ptr (if step then 1 else 0)
-      if cstr == nullPtr then kccurdb cur >>= flip kcThrow "kccurgetkey"
-        else do
-        len <- peek ptr
-        BS.unsafePackCStringFinalizer (castPtr cstr) (fromIntegral len) (kcfree cstr)
+      bsOfCString cstr ptr
 
 foreign import ccall safe "kclangc.h kccurgetvalue" _kccurgetvalue
   :: Ptr KCCUR -> Ptr CSize -> CInt -> IO CString
@@ -1268,26 +1305,23 @@ foreign import ccall safe "kclangc.h kccurgetvalue" _kccurgetvalue
 -- | Get a pair of the key and the value of the current record.
 kccurget :: KcCur
          -> Bool -- ^ step
-         -> IO (BS.ByteString, BS.ByteString)
+         -> IO (Maybe (BS.ByteString, BS.ByteString))
 kccurget cur step = do
   withForeignPtr (unKcCur cur) $ \c_cur -> do
     alloca $ \ksp -> do
       alloca $ \vbp -> do
         alloca $ \vsp -> do
           cstr <- _kccurget c_cur ksp vbp vsp (if step then 1 else 0)
-          if cstr == nullPtr then kccurdb cur >>= flip kcThrow "kccurget"
-            else do
-            ks <- peek ksp
-            key <- BS.unsafePackCStringFinalizer (castPtr cstr) (fromIntegral ks)
-                     (kcfree cstr) -- also frees vp
-            vb <- peek vbp
-            vs <- peek vsp
-            val <- BS.packCStringLen (vb, fromIntegral vs)
-            return (key, val)
+          maybeKey <- bsOfCString cstr ksp
+          case maybeKey of
+            Just key -> do vb <- peek vbp
+                           vs <- peek vsp
+                           val <- BS.packCStringLen (vb, fromIntegral vs)
+                           return $ Just (key, val)
+            Nothing -> return Nothing
 
 foreign import ccall safe "kclangc.h kccurget" _kccurget
-  :: Ptr KCCUR -> Ptr CSize -> Ptr CString -> Ptr CSize -> CInt ->
-     IO CString
+  :: Ptr KCCUR -> Ptr CSize -> Ptr CString -> Ptr CSize -> CInt -> IO CString
 
 -- | Jump the cursor to the first record for forward scan.
 kccurjump :: KcCur -> IO ()
@@ -1387,6 +1421,298 @@ foreign import ccall unsafe "kclangc.h kccuremsg" _kccuremsg
   :: Ptr KCCUR -> IO CString
 
 --------------------------------------------------------------------------------
+-- KcMap
+
+newtype KcMap = KcMap { unKcMap :: ForeignPtr KCMAP } deriving (Eq)
+data KCMAP      -- native type
+
+-- | Create a string hash map object.
+kcmapnew :: Int -- ^ the number of buckets of the hash table. If it is
+                -- not more than 0, the default setting 31 is specified.
+         -> IO KcMap
+kcmapnew sz = do
+  m <- _kcmapnew $ fromIntegral sz
+  fp <- newForeignPtr_ m
+  return $ KcMap fp
+
+foreign import ccall unsafe "kclangc.h kcmapnew" _kcmapnew
+  :: CSize -> IO (Ptr KCMAP)
+
+-- | Destroy a map object.
+kcmapdel :: KcMap -> IO ()
+kcmapdel m = do
+  withForeignPtr (unKcMap m) $ \c_map -> do
+    _kcmapdel c_map
+
+foreign import ccall unsafe "kclangc.h kcmapdel" _kcmapdel
+  :: Ptr KCMAP -> IO ()
+
+-- | Set the value of a record. If no record corresponds to the key, a
+-- new record is created.  If the corresponding record exists, the
+-- value is overwritten.
+kcmapset :: KcMap
+         -> BS.ByteString -- ^ key
+         -> BS.ByteString -- ^ value
+         -> IO ()
+kcmapset m key val =
+  withForeignPtr (unKcMap m) $ \c_map -> do
+    BS.unsafeUseAsCStringLen key $ \(kbuf, ksiz) ->
+      BS.unsafeUseAsCStringLen val $ \(vbuf, vsiz) -> do
+        _kcmapset c_map kbuf (fromIntegral ksiz) vbuf (fromIntegral vsiz)
+
+foreign import ccall unsafe "kclangc.h kcmapset" _kcmapset
+  :: Ptr KCMAP -> CString -> CSize -> CString -> CSize -> IO ()
+
+-- | Add a record. If no record corresponds to the key, a new record
+-- is created.  If the corresponding record exists, the record is not
+-- modified and false is returned.
+kcmapadd :: KcMap
+         -> BS.ByteString -- ^ key
+         -> BS.ByteString -- ^ value
+         -> IO ()
+kcmapadd m key val =
+  withForeignPtr (unKcMap m) $ \c_map -> do
+    BS.unsafeUseAsCStringLen key $ \(kbuf, ksiz) ->
+      BS.unsafeUseAsCStringLen val $ \(vbuf, vsiz) -> do
+        _kcmapadd c_map kbuf (fromIntegral ksiz) vbuf (fromIntegral vsiz)
+        >>= handleMapBoolResult "kcmapadd"
+
+foreign import ccall safe "kclangc.h kcmapadd" _kcmapadd
+  :: Ptr KCMAP -> CString -> CSize -> CString -> CSize -> IO CInt
+
+-- | Replace the value of a record. If no record corresponds to the
+-- key, no new record is created and false is returned. If the
+-- corresponding record exists, the value is modified.
+kcmapreplace :: KcMap
+             -> BS.ByteString -- ^ key
+             -> BS.ByteString -- ^ value
+             -> IO ()
+kcmapreplace m key val =
+  withForeignPtr (unKcMap m) $ \c_map -> do
+    BS.unsafeUseAsCStringLen key $ \(kbuf, ksiz) ->
+      BS.unsafeUseAsCStringLen val $ \(vbuf, vsiz) ->
+        _kcmapreplace c_map kbuf (fromIntegral ksiz) vbuf (fromIntegral vsiz)
+        >>= handleMapBoolResult "kcmapreplace"
+
+foreign import ccall safe "kclangc.h kcmapreplace" _kcmapreplace
+  :: Ptr KCMAP -> CString -> CSize -> CString -> CSize -> IO CInt
+
+-- | Append the value of a record. If no record corresponds to the
+-- key, a new record is created.  If the corresponding record exists,
+-- the given value is appended at the end of the existing value.
+kcmapappend :: KcMap
+            -> BS.ByteString -- ^ key
+            -> BS.ByteString -- ^ value
+            -> IO ()
+kcmapappend m key val =
+  withForeignPtr (unKcMap m) $ \c_map -> do
+    BS.unsafeUseAsCStringLen key $ \(kbuf, ksiz) ->
+      BS.unsafeUseAsCStringLen val $ \(vbuf, vsiz) ->
+        _kcmapappend c_map kbuf (fromIntegral ksiz) vbuf (fromIntegral vsiz)
+
+foreign import ccall safe "kclangc.h kcmapappend" _kcmapappend
+  :: Ptr KCMAP -> CString -> CSize -> CString -> CSize -> IO ()
+
+-- | Remove a record. If no record corresponds to the key, false is returned.
+kcmapremove :: KcMap
+            -> BS.ByteString -- ^ key
+            -> IO ()
+kcmapremove m key =
+  withForeignPtr (unKcMap m) $ \c_map -> do
+    BS.unsafeUseAsCStringLen key $ \(kbuf, ksiz) -> do
+      _kcmapremove c_map kbuf (fromIntegral ksiz)
+      >>= handleMapBoolResult "kcmapremove"
+
+foreign import ccall safe "kclangc.h kcmapremove" _kcmapremove
+  :: Ptr KCMAP -> CString -> CSize -> IO CInt
+
+-- | Retrieve the value of a record.
+kcmapget :: KcMap
+         -> BS.ByteString -- ^ key
+         -> IO (Maybe BS.ByteString)
+kcmapget m key =
+  withForeignPtr (unKcMap m) $ \c_map -> do
+    BS.unsafeUseAsCStringLen key $ \(kbuf, ksiz) -> do
+      alloca $ \ptr -> do
+        cstr <- _kcmapget c_map kbuf (fromIntegral ksiz) ptr
+        bsOfCString cstr ptr
+
+foreign import ccall safe "kclangc.h kcmapget" _kcmapget
+  :: Ptr KCMAP -> CString -> CSize -> Ptr CSize -> IO CString
+
+-- | Remove all records.
+kcmapclear :: KcMap -> IO ()
+kcmapclear m =
+  withForeignPtr (unKcMap m) $ \c_map -> do
+    _kcmapclear c_map >>= handleMapBoolResult "kcmapclear"
+
+foreign import ccall safe "kclangc.h kcmapclear" _kcmapclear
+  :: Ptr KCMAP -> IO CInt
+
+-- | Get the number of records.
+kcmapcount :: KcMap -> IO Int
+kcmapcount m =
+  withForeignPtr (unKcMap m) $ \c_map -> do
+    n <- _kcmapcount c_map
+    if n == -1 then throwIO (KcException "kcmapcount" KCEINVALID "")
+      else return (fromIntegral n)
+
+foreign import ccall safe "kclangc.h kcmapcount" _kcmapcount
+  :: Ptr KCMAP -> IO CSize
+
+--------------------------------------------------------------------------------
+-- KcMapIter
+
+newtype KcMapIter = KcMapIter { unKcMapIter :: ForeignPtr KCMAPITER } deriving (Eq)
+data KCMAPITER      -- native type
+
+-- | Create a string hash map iterator object. The object of the
+-- return value should be released with the 'kcmapiterdel' function when
+-- it is no longer in use. This object will not be invalidated even
+-- when the map object is updated once. However, phantom records may
+-- be retrieved if they are removed after creation of each iterator.
+kcmapiterator :: KcMap -> IO KcMapIter
+kcmapiterator m =
+  withForeignPtr (unKcMap m) $ \c_map -> do
+    mi <- _kcmapiterator c_map
+    fp <- newForeignPtr_ mi
+    return $ KcMapIter fp
+
+foreign import ccall safe "kclangc.h kcmapiterator" _kcmapiterator
+  :: Ptr KCMAP -> IO (Ptr KCMAPITER)
+
+-- | Destroy an iterator object.
+kcmapiterdel :: KcMapIter -> IO ()
+kcmapiterdel mi = withForeignPtr (unKcMapIter mi) _kcmapiterdel
+
+foreign import ccall safe "kclangc.h kcmapiterdel" _kcmapiterdel
+  :: Ptr KCMAPITER -> IO ()
+
+-- | Get the key of the current record.
+kcmapitergetkey :: KcMapIter -> Int -> IO (Maybe BS.ByteString)
+kcmapitergetkey mi sz = do
+  withForeignPtr (unKcMapIter mi) $ \c_mi -> do
+    cstr <- _kcmapitergetkey c_mi (fromIntegral sz)
+    if cstr == nullPtr then return Nothing
+      else do bs <- BS.packCString cstr
+              return $ Just bs
+
+foreign import ccall safe "kclangc.h kcmapitergetkey" _kcmapitergetkey
+  :: Ptr KCMAPITER -> CSize -> IO CString
+
+-- | Get the value of the current record.
+kcmapitergetvalue :: KcMapIter -> Int -> IO (Maybe BS.ByteString)
+kcmapitergetvalue mi sz = do
+  withForeignPtr (unKcMapIter mi) $ \c_mi -> do
+    cstr <- _kcmapitergetvalue c_mi (fromIntegral sz)
+    if cstr == nullPtr then return Nothing
+      else do bs <- BS.packCString cstr
+              return $ Just bs
+
+foreign import ccall safe "kclangc.h kcmapitergetvalue" _kcmapitergetvalue
+  :: Ptr KCMAPITER -> CSize -> IO CString
+
+-- | Get a pair of the key and the value of the current record.
+kcmapiterget :: KcMapIter -> IO (Maybe (BS.ByteString, BS.ByteString))
+kcmapiterget mi = do
+  withForeignPtr (unKcMapIter mi) $ \c_mi -> do
+    alloca $ \ksp -> do
+      alloca $ \vbp -> do
+        alloca $ \vsp -> do
+          cstr <- _kcmapiterget c_mi ksp vbp vsp
+          maybeKey <- bsOfCString cstr ksp
+          case maybeKey of
+            Just key -> do vb <- peek vbp
+                           vs <- peek vsp
+                           val <- BS.packCStringLen (vb, fromIntegral vs)
+                           return $ Just (key, val)
+            Nothing -> return Nothing
+
+foreign import ccall safe "kclangc.h kcmapiterget" _kcmapiterget
+  :: Ptr KCMAPITER -> Ptr CSize -> Ptr CString -> Ptr CSize -> IO CString
+
+-- | Step the cursor to the next record.
+kcmapiterstep :: KcMapIter -> IO ()
+kcmapiterstep mi = withForeignPtr (unKcMapIter mi) _kcmapiterstep
+
+foreign import ccall safe "kclangc.h kcmapiterstep" _kcmapiterstep
+  :: Ptr KCMAPITER -> IO ()
+
+--------------------------------------------------------------------------------
+-- KcMapSort
+
+newtype KcMapSort = KcMapSort { unKcMapSort :: ForeignPtr KCMAPSORT } deriving (Eq)
+data KCMAPSORT      -- native type
+
+-- | Create a string hash map sorter object. This object will not be
+-- invalidated even when the map object is updated once. However,
+-- phantom records may be retrieved if they are removed after creation
+-- of each sorter.
+kcmapsorter :: KcMap -> IO KcMapSort
+kcmapsorter m =
+  withForeignPtr (unKcMap m) $ \c_map -> do
+    ms <- _kcmapsorter c_map
+    fp <- newForeignPtr_ ms
+    return $ KcMapSort fp
+
+foreign import ccall safe "kclangc.h kcmapsorter" _kcmapsorter
+  :: Ptr KCMAP -> IO (Ptr KCMAPSORT)
+
+kcmapsortdel :: KcMapSort -> IO ()
+kcmapsortdel ms = withForeignPtr (unKcMapSort ms) _kcmapsortdel
+
+foreign import ccall safe "kclangc.h kcmapsortdel" _kcmapsortdel
+  :: Ptr KCMAPSORT -> IO ()
+
+-- | Get the key of the current record.
+kcmapsortgetkey :: KcMapSort -> IO (Maybe BS.ByteString)
+kcmapsortgetkey ms =
+  withForeignPtr (unKcMapSort ms) $ \c_ms -> do
+    alloca $ \spp -> do
+      cstr <- _kcmapsortgetkey c_ms spp
+      bsOfCString cstr spp
+
+foreign import ccall safe "kclangc.h kcmapsortgetkey" _kcmapsortgetkey
+  :: Ptr KCMAPSORT -> Ptr CSize -> IO CString
+
+-- | Get the value of the current record.
+kcmapsortgetvalue :: KcMapSort -> IO (Maybe BS.ByteString)
+kcmapsortgetvalue ms =
+  withForeignPtr (unKcMapSort ms) $ \c_ms -> do
+    alloca $ \spp -> do
+      cstr <- _kcmapsortgetvalue c_ms spp
+      bsOfCString cstr spp
+
+foreign import ccall safe "kclangc.h kcmapsortgetvalue" _kcmapsortgetvalue
+  :: Ptr KCMAPSORT -> Ptr CSize -> IO CString
+
+-- | Get a pair of the key and the value of the current record.
+kcmapsortget :: KcMapSort -> IO (Maybe (BS.ByteString, BS.ByteString))
+kcmapsortget ms = do
+  withForeignPtr (unKcMapSort ms) $ \c_ms -> do
+    alloca $ \ksp -> do
+      alloca $ \vbp -> do
+        alloca $ \vsp -> do
+          cstr <- _kcmapsortget c_ms ksp vbp vsp
+          maybeKey <- bsOfCString cstr ksp
+          case maybeKey of
+            Just key -> do vb <- peek vbp
+                           vs <- peek vsp
+                           val <- BS.packCStringLen (vb, fromIntegral vs)
+                           return $ Just (key, val)
+            Nothing -> return Nothing
+
+foreign import ccall safe "kclangc.h kcmapsortget" _kcmapsortget
+  :: Ptr KCMAPSORT -> Ptr CSize -> Ptr CString -> Ptr CSize -> IO CString
+
+-- | Step the sorter to the next record.
+kcmapsortstep :: KcMapSort -> IO ()
+kcmapsortstep ms = withForeignPtr (unKcMapSort ms) _kcmapsortstep
+
+foreign import ccall safe "kclangc.h kcmapsortstep" _kcmapsortstep
+  :: Ptr KCMAPSORT -> IO ()
+
+--------------------------------------------------------------------------------
 -- Helper Routines
 
 -- | Brackets a db command between 'kcdbnew', 'kcdbopen', 'kcdbclose',
@@ -1417,5 +1743,19 @@ kcwithdbtran db hard action =
   bracketOnError (kcdbbegintran db hard)
                  (const $ kcdbendtran db False)
                  (const $ do rv <- action; kcdbendtran db True; return rv)
+
+-- | Brackets a map command between 'kcmapnew', and 'kcmapdel' calls.
+kcwithmap :: Int -> (KcMap -> IO a) -> IO a
+kcwithmap sz action =
+  bracketOnError (kcmapnew sz) kcmapdel
+                 (\m -> do rv <- action m; kcmapdel m; return rv)
+
+-- | Brackets a map iterator command between 'kcmapiterator' and 'kcmapiterdel' calls.
+kcwithmapiter :: KcMap -> (KcMapIter -> IO a) -> IO a
+kcwithmapiter m action = bracket (kcmapiterator m) kcmapiterdel action
+
+-- | Brackets a map sorter command between 'kcmapsorter' and 'kcmapsortdel' calls.
+kcwithmapsort :: KcMap -> (KcMapSort -> IO a) -> IO a
+kcwithmapsort m action = bracket (kcmapsorter m) kcmapsortdel action
 
 --------------------------------------------------------------------------------

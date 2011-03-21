@@ -107,6 +107,7 @@ module Database.KyotoCabinet.Db (
   kcdbgetbulk,
   kcdbclear,
   kcdbsync,
+  kcdboccupy,
   kcdbcopy,
   kcdbbegintran,
   kcdbbegintrantry,
@@ -250,15 +251,37 @@ bssOfCstrs (h:t) = do
   rest <- bssOfCstrs t
   return $ bs' `seq` (bs':rest)
 
-bsOfCString :: CString -> Ptr CSize -> IO (Maybe BS.ByteString)
-bsOfCString cstr szp =
+allocFreedBsOfCstrLen :: CString -> Ptr CSize -> IO (Maybe BS.ByteString)
+allocFreedBsOfCstrLen cstr szp =
   if cstr == nullPtr then return Nothing
   else do
     csiz <- peek szp
-    bs <- BS.unsafePackCStringFinalizer (castPtr cstr) (fromIntegral csiz)
-          (kcfree cstr)
+    bs <- BS.unsafePackCStringFinalizer (castPtr cstr) (fromIntegral csiz) (kcfree cstr)
     return $ Just bs
-
+{-
+allocFreedBsOfCstr :: CString -> IO (Maybe BS.ByteString)
+allocFreedBsOfCstr cstr =
+  if cstr == nullPtr then return Nothing
+  else do
+    csiz <- BS.c_strlen cstr
+    bs <- BS.unsafePackCStringFinalizer (castPtr cstr) (fromIntegral csiz) (kcfree cstr)
+    return $ Just bs
+-}
+allocCopiedBsOfCstrLen :: CString -> Ptr CSize -> IO (Maybe BS.ByteString)
+allocCopiedBsOfCstrLen cstr szp =
+  if cstr == nullPtr then return Nothing
+  else do
+    csiz <- peek szp
+    key <- BS.packCStringLen (cstr, fromIntegral csiz)
+    return $ Just key
+{-
+allocCopiedBsOfCstr :: CString -> IO (Maybe BS.ByteString)
+allocCopiedBsOfCstr cstr =
+  if cstr == nullPtr then return Nothing
+  else do
+    key <- BS.packCString cstr
+    return $ Just key
+-}
 --------------------------------------------------------------------------------
 -- Constants
 
@@ -420,7 +443,9 @@ int64_min = #const INT64_MIN
 --------------------------------------------------------------------------------
 -- Utilities
 
--- | Allocate a region on memory.
+-- | Allocate a region on memory. Returns a pointer to the allocated
+-- region.  The region of the return value should be released with the
+-- 'kcfree' function when it is no longer in use.
 kcmalloc :: Int -> IO (Ptr a)
 kcmalloc sz = _kcmalloc (fromIntegral sz)
 
@@ -548,7 +573,9 @@ handleMapBoolResult fname status =
 newtype KcDb = KcDb { unKcDb :: ForeignPtr KCDB }
 data KCDB      -- native type
 
--- | Create a polymorphic database object.
+-- | Create a polymorphic database object. The object of the return
+-- value should be released with the kcdbdel function when it is no
+-- longer in use.
 kcdbnew :: IO KcDb
 kcdbnew = _kcdbnew >>= wrapdb
 
@@ -724,7 +751,7 @@ kcdbopen db path tune mode =
 foreign import ccall safe "kclangc.h kcdbopen" _kcdbopen
   :: Ptr KCDB -> CString -> CUInt -> IO CInt
 
--- | Close the database file.
+-- | Close the database file. Throws a 'KcException' on failure.
 kcdbclose :: KcDb -> IO ()
 kcdbclose db =
   withForeignPtr (unKcDb db) $ \c_db -> do
@@ -743,7 +770,7 @@ kcdbecode db =
 foreign import ccall unsafe "kclangc.h kcdbecode" _kcdbecode
   :: Ptr KCDB -> IO CInt
 
--- | Get the supplement message of the last happened error.
+-- | Get the supplement message of the last occurring error.
 kcdbemsg :: KcDb -> IO String
 kcdbemsg db =
   withForeignPtr (unKcDb db) $ \c_db -> do
@@ -753,10 +780,15 @@ kcdbemsg db =
 foreign import ccall unsafe "kclangc.h kcdbemsg" _kcdbemsg
   :: Ptr KCDB -> IO CString
 
--- | Accept a visitor to a record.
+-- | Accept a visitor to a record. The operation for each record is
+-- performed atomically and other threads accessing the same record
+-- are blocked.  To avoid deadlock, any explicit database operation
+-- must not be performed in this function. Throws a 'KcException' on
+-- failure.
 kcdbaccept :: KcDb
            -> BS.ByteString -- ^ key
-           -> KcVisitFull -> KcVisitEmpty
+           -> KcVisitFull -- ^ a call back function to visit a record
+           -> KcVisitEmpty -- ^ a call back function to visit an empty record space
            -> Bool -- ^ writable
            -> IO ()
 kcdbaccept db key visitFull visitEmpty writable =
@@ -774,10 +806,15 @@ foreign import ccall safe "kclangc.h kcdbaccept" _kcdbaccept
   :: Ptr KCDB -> CString -> CSize -> FunPtr KCVISITFULL -> FunPtr KCVISITEMPTY ->
      Ptr () -> CInt -> IO CInt
 
--- | Accept a visitor to multiple records at once.
+-- | Accept a visitor to multiple records at once. The operations for
+-- specified records are performed atomically and other threads
+-- accessing the same records are blocked.  To avoid deadlock, any
+-- explicit database operation must not be performed in this
+-- function. Throws a 'KcException' on failure.
 kcdbacceptbulk :: KcDb
                -> [BS.ByteString] -- ^ keys
-               -> KcVisitFull -> KcVisitEmpty
+               -> KcVisitFull -- ^ a call back function to visit a record
+               -> KcVisitEmpty -- ^ a call back function to visit an empty record space
                -> Bool -- ^ writable
                -> IO ()
 kcdbacceptbulk db keys visitFull visitEmpty writable = do
@@ -796,10 +833,12 @@ foreign import ccall safe "kclangc.h kcdbacceptbulk" _kcdbacceptbulk
   :: Ptr KCDB -> Ptr KcStr -> CSize -> FunPtr KCVISITFULL -> FunPtr KCVISITEMPTY ->
      Ptr () -> CInt -> IO CInt
 
--- | Iterate to accept a visitor for each record.
+-- | Iterate to accept a visitor for each record. The whole iteration
+-- is performed atomically and other threads are blocked. Throws a
+-- 'KcException' on failure.
 kcdbiterate :: KcDb -> KcVisitFull
-               -> Bool -- ^ writable
-               -> IO ()
+            -> Bool -- ^ writable
+            -> IO ()
 kcdbiterate db visitFull writable = do
   withForeignPtr (unKcDb db) $ \c_db -> do
     vf <- wrapKCVISITFULL $ callVisitFull visitFull
@@ -810,7 +849,9 @@ kcdbiterate db visitFull writable = do
 foreign import ccall safe "kclangc.h kcdbiterate" _kcdbiterate
   :: Ptr KCDB -> FunPtr KCVISITFULL -> Ptr () -> CInt -> IO CInt
 
--- | Set the value of a record.
+-- | Set the value of a record. If no record corresponds to the key, a
+-- new record is created.  If the corresponding record exists, the
+-- value is overwritten. Throws a 'KcException' on failure.
 kcdbset :: KcDb
         -> BS.ByteString -- ^ key
         -> BS.ByteString -- ^ value
@@ -825,7 +866,9 @@ kcdbset db key val =
 foreign import ccall safe "kclangc.h kcdbset" _kcdbset
   :: Ptr KCDB -> CString -> CSize -> CString -> CSize -> IO CInt
 
--- | Add a record.
+-- | Add a record. If no record corresponds to the key, a new record
+-- is created.  If the corresponding record exists, the record is not
+-- modified and a 'KcException' is thrown.
 kcdbadd :: KcDb
         -> BS.ByteString -- ^ key
         -> BS.ByteString -- ^ value
@@ -840,7 +883,9 @@ kcdbadd db key val =
 foreign import ccall safe "kclangc.h kcdbadd" _kcdbadd
   :: Ptr KCDB -> CString -> CSize -> CString -> CSize -> IO CInt
 
--- | Replace the value of a record.
+-- | Replace the value of a record. If no record corresponds to the
+-- key, no new record is created and a 'KcException' is thrown. If the
+-- corresponding record exists, the value is modified.
 kcdbreplace :: KcDb
             -> BS.ByteString -- ^ key
             -> BS.ByteString -- ^ value
@@ -855,7 +900,10 @@ kcdbreplace db key val =
 foreign import ccall safe "kclangc.h kcdbreplace" _kcdbreplace
   :: Ptr KCDB -> CString -> CSize -> CString -> CSize -> IO CInt
 
--- | Append the value of a record.
+-- | Append the value of a record. If no record corresponds to the
+-- key, a new record is created.  If the corresponding record exists,
+-- the given value is appended at the end of the existing
+-- value. Throws a 'KcException' on failure.
 kcdbappend :: KcDb
            -> BS.ByteString -- ^ key
            -> BS.ByteString -- ^ value
@@ -870,7 +918,8 @@ kcdbappend db key val =
 foreign import ccall safe "kclangc.h kcdbappend" _kcdbappend
   :: Ptr KCDB -> CString -> CSize -> CString -> CSize -> IO CInt
 
--- | Add a number to the numeric value of a record.
+-- | Add a number to the numeric value of a record. Throws a
+-- 'KcException' on failure.
 kcdbincrint :: KcDb
             -> BS.ByteString -- ^ key
             -> Int64 -- ^ increment amount
@@ -885,7 +934,7 @@ kcdbincrint db key num =
 foreign import ccall safe "kclangc.h kcdbincrint" _kcdbincrint
   :: Ptr KCDB -> CString -> CSize -> CLLong -> IO CLLong
 
--- | Add a number to the numeric value of a record.
+-- | Add a number to the numeric value of a record. Throws a 'KcException' on failure.
 kcdbincrdouble :: KcDb
                -> BS.ByteString -- ^ key
                -> Double -- ^ increment amount
@@ -901,7 +950,7 @@ kcdbincrdouble db key num =
 foreign import ccall safe "kclangc.h kcdbincrdouble" _kcdbincrdouble
   :: Ptr KCDB -> CString -> CSize -> CDouble -> IO CDouble
 
--- | Perform compare-and-swap.
+-- | Perform compare-and-swap. Throws a 'KcException' on failure.
 kcdbcas :: KcDb
         -> BS.ByteString -- ^ key
         -> BS.ByteString -- ^ old value
@@ -920,7 +969,8 @@ foreign import ccall safe "kclangc.h kcdbcas" _kcdbcas
   :: Ptr KCDB -> CString -> CSize -> CString -> CSize ->
      CString -> CSize -> IO CInt
 
--- | Remove a record.
+-- | Remove a record. If no record corresponds to the key, a
+-- 'KcException' is thrown.
 kcdbremove :: KcDb
            -> BS.ByteString -- ^ key
            -> IO ()
@@ -941,7 +991,7 @@ kcdbget db key =
     BS.unsafeUseAsCStringLen key $ \(kbuf, ksiz) -> do
       alloca $ \ptr -> do
         cstr <- _kcdbget c_db kbuf (fromIntegral ksiz) ptr
-        bsOfCString cstr ptr
+        allocFreedBsOfCstrLen cstr ptr
 
 foreign import ccall safe "kclangc.h kcdbget" _kcdbget
   :: Ptr KCDB -> CString -> CSize -> Ptr CSize -> IO CString
@@ -965,7 +1015,7 @@ kcdbgetbuf db key maxElts =
 foreign import ccall safe "kclangc.h kcdbgetbuf" _kcdbgetbuf
   :: Ptr KCDB -> CString -> CSize -> CString -> CSize -> IO CInt
 
--- | Store records at once.
+-- | Store several records at once. Throws a 'KcException' on failure.
 kcdbsetbulk :: KcDb
             -> [(BS.ByteString, BS.ByteString)] -- ^ records to store
             -> Bool  -- ^ atomic
@@ -980,7 +1030,7 @@ kcdbsetbulk db recs atomic =
 foreign import ccall safe "kclangc.h kcdbsetbulk" _kcdbsetbulk
   :: Ptr KCDB -> Ptr KcRec -> CSize -> CInt -> IO CLLong
 
--- | Remove records at once.
+-- | Remove several records at once. Throws a 'KcException' on failure.
 kcdbremovebulk :: KcDb
                -> [BS.ByteString] -- ^ keys of records to remove
                -> Bool -- ^ atomic
@@ -995,7 +1045,7 @@ kcdbremovebulk db keys atomic =
 foreign import ccall safe "kclangc.h kcdbremovebulk" _kcdbremovebulk
   :: Ptr KCDB -> Ptr KcStr -> CSize -> CInt -> IO CLLong
 
--- | Retrieve records at once.
+-- | Retrieve several records at once. Throws a 'KcException' on failure.
 kcdbgetbulk :: KcDb
             -> [BS.ByteString] -- ^ keys of the records to retrieve
             -> Bool -- ^ atomic
@@ -1015,7 +1065,7 @@ kcdbgetbulk db keys atomic =
 foreign import ccall safe "kclangc.h kcdbgetbulk" _kcdbgetbulk
   :: Ptr KCDB -> Ptr KcStr -> CSize -> Ptr KcRec -> CInt -> IO CLLong
 
--- | Remove all records.
+-- | Remove all records. Throws a 'KcException' on failure.
 kcdbclear :: KcDb -> IO ()
 kcdbclear db =
   withForeignPtr (unKcDb db) $ \c_db -> do
@@ -1024,7 +1074,11 @@ kcdbclear db =
 foreign import ccall safe "kclangc.h kcdbclear" _kcdbclear
   :: Ptr KCDB -> IO CInt
 
--- | Synchronize updated contents with the file and the device.
+-- | Synchronize updated contents with the file and the device. The
+-- operation of the postprocessor is performed atomically and other
+-- threads accessing the same record are blocked.  To avoid deadlock,
+-- any explicit database operation must not be performed in this
+-- function. Throws a 'KcException' on failure.
 kcdbsync :: KcDb
          -> Bool -- ^ @True@ for physical synchronization, @False@ for
                  -- logical synchronization
@@ -1040,7 +1094,26 @@ kcdbsync db hard fileProc = do
 foreign import ccall safe "kclangc.h kcdbsync" _kcdbsync
   :: Ptr KCDB -> CInt -> FunPtr KCFILEPROC -> Ptr () -> IO CInt
 
--- | Create a copy of the database file.
+-- | Occupy database by locking and do something meanwhile. The
+-- operation of the processor is performed atomically and other
+-- threads accessing the same record are blocked.  To avoid deadlock,
+-- any explicit database operation must not be performed in this
+-- function. Throws a 'KcException' on failure.
+kcdboccupy :: KcDb
+           -> Bool -- ^ @True@ to use writer lock, or @False@ to use reader lock
+           -> KcFileProc -- ^ a processor callback
+           -> IO ()
+kcdboccupy db writable fileProc = do
+  withForeignPtr (unKcDb db) $ \c_db -> do
+    fp <- wrapKCFILEPROC $ callFileProc fileProc
+    rv <- _kcdboccupy c_db (if writable then 1 else 0) fp nullPtr
+    freeHaskellFunPtr fp
+    handleBoolResult db "kcdboccupy" rv
+
+foreign import ccall safe "kclangc.h kcdboccupy" _kcdboccupy
+  :: Ptr KCDB -> CInt -> FunPtr KCFILEPROC -> Ptr () -> IO CInt
+
+-- | Create a copy of the database file. Throws a 'KcException' on failure.
 kcdbcopy :: KcDb
          -> FilePath -- ^ path to the destination file
          -> IO ()
@@ -1052,7 +1125,7 @@ kcdbcopy db dest =
 foreign import ccall safe "kclangc.h kcdbcopy" _kcdbcopy
   :: Ptr KCDB -> CString -> IO CInt
 
--- | Begin transaction.
+-- | Begin transaction. Throws a 'KcException' on failure.
 kcdbbegintran :: KcDb
               -> Bool -- ^ @True@ for physical synchronization, @False@
                       -- for logical synchronization
@@ -1065,7 +1138,7 @@ kcdbbegintran db hard =
 foreign import ccall safe "kclangc.h kcdbbegintran" _kcdbbegintran
   :: Ptr KCDB -> CInt -> IO CInt
 
--- | Try to begin transaction.
+-- | Try to begin transaction. Throws a 'KcException' on failure.
 kcdbbegintrantry :: KcDb
                  -> Bool  -- ^ @True@ for physical synchronization,
                           -- @False@ for logical synchronization
@@ -1078,7 +1151,7 @@ kcdbbegintrantry db hard =
 foreign import ccall safe "kclangc.h kcdbbegintrantry" _kcdbbegintrantry
   :: Ptr KCDB -> CInt -> IO CInt
 
--- | End transaction.
+-- | End transaction. Throws a 'KcException' on failure.
 kcdbendtran :: KcDb
             -> Bool  -- ^ @True@ to commit, @False@ to abort
             -> IO ()
@@ -1090,7 +1163,7 @@ kcdbendtran db commit =
 foreign import ccall safe "kclangc.h kcdbendtran" _kcdbendtran
   :: Ptr KCDB -> CInt -> IO CInt
 
--- | Dump records into a file.
+-- | Dump records into a file. Throws a 'KcException' on failure.
 kcdbdumpsnap :: KcDb
              -> FilePath -- ^ destination file
              -> IO ()
@@ -1102,7 +1175,7 @@ kcdbdumpsnap db dest =
 foreign import ccall safe "kclangc.h kcdbdumpsnap" _kcdbdumpsnap
   :: Ptr KCDB -> CString -> IO CInt
 
--- | Load records from a file.
+-- | Load records from a file. Throws a 'KcException' on failure.
 kcdbloadsnap :: KcDb
              -> FilePath -- ^ source file
              -> IO ()
@@ -1114,7 +1187,7 @@ kcdbloadsnap db src =
 foreign import ccall safe "kclangc.h kcdbloadsnap" _kcdbloadsnap
   :: Ptr KCDB -> CString -> IO CInt
 
--- | Get the number of records.
+-- | Get the number of records. Throws a 'KcException' on failure.
 kcdbcount :: KcDb -> IO Int64
 kcdbcount db =
   withForeignPtr (unKcDb db) $ \c_db -> do
@@ -1124,7 +1197,7 @@ kcdbcount db =
 foreign import ccall safe "kclangc.h kcdbcount" _kcdbcount
   :: Ptr KCDB -> IO CLLong
 
--- | Get the size of the database file.
+-- | Get the size of the database file. Throws a 'KcException' on failure.
 kcdbsize :: KcDb -> IO Int64
 kcdbsize db =
   withForeignPtr (unKcDb db) $ \c_db -> do
@@ -1134,7 +1207,7 @@ kcdbsize db =
 foreign import ccall unsafe "kclangc.h kcdbsize" _kcdbsize
   :: Ptr KCDB -> IO CLLong
 
--- | Get the path of the database file.
+-- | Get the path of the database file. Throws a 'KcException' on failure.
 kcdbpath :: KcDb -> IO String
 kcdbpath db =
   withForeignPtr (unKcDb db) $ \c_db -> do
@@ -1147,7 +1220,7 @@ kcdbpath db =
 foreign import ccall safe "kclangc.h kcdbpath" _kcdbpath
   :: Ptr KCDB -> IO CString
 
--- | Get the miscellaneous status information.
+-- | Get the miscellaneous status information. Throws a 'KcException' on failure.
 kcdbstatus :: KcDb -> IO String
 kcdbstatus db =
   withForeignPtr (unKcDb db) $ \c_db -> do
@@ -1160,7 +1233,7 @@ kcdbstatus db =
 foreign import ccall safe "kclangc.h kcdbstatus" _kcdbstatus
   :: Ptr KCDB -> IO CString
 
--- | Get keys matching a prefix string.
+-- | Get keys matching a prefix string. Throws a 'KcException' on failure.
 kcdbmatchprefix :: KcDb
                 -> BS.ByteString -- ^ prefix
                 -> Int -- ^ max elements to return
@@ -1176,7 +1249,7 @@ kcdbmatchprefix db prefix maxElts = do
 foreign import ccall safe "kclangc.h kcdbmatchprefix" _kcdbmatchprefix
   :: Ptr KCDB -> CString -> Ptr CString -> CSize -> IO CLLong
 
--- | Get keys matching a regular expression string.
+-- | Get keys matching a regular expression string. Throws a 'KcException' on failure.
 kcdbmatchregex :: KcDb
                -> BS.ByteString -- ^ regexp
                -> Int -- ^ max elements to return
@@ -1192,7 +1265,7 @@ kcdbmatchregex db regexp maxElts = do
 foreign import ccall safe "kclangc.h kcdbmatchregex" _kcdbmatchregex
   :: Ptr KCDB -> CString -> Ptr CString -> CSize -> IO CLLong
 
--- | Merge records from other databases.
+-- | Merge records from other databases. Throws a 'KcException' on failure.
 kcdbmerge :: KcDb
           -> [KcDb] -- ^ database sources
           -> KcMergeMode -- ^ merge mode:
@@ -1224,7 +1297,8 @@ foreign import ccall safe "kclangc.h kcdbmerge" _kcdbmerge
 newtype KcCur = KcCur { unKcCur :: ForeignPtr KCCUR } deriving (Eq)
 data KCCUR      -- native type
 
--- | Create a cursor object.
+-- | Create a cursor object. The object of the return value should be
+-- released with the kccurdel function when it is no longer in use.
 kcdbcursor :: KcDb -> IO KcCur
 kcdbcursor db =
   withForeignPtr (unKcDb db) $ \c_db -> do
@@ -1248,7 +1322,11 @@ kccurdel cur =
 foreign import ccall safe "kclangc.h kccurdel" _kccurdel
   :: Ptr KCCUR -> IO ()
 
--- | Accept a visitor to the current record.
+-- | Accept a visitor to the current record. The operation for each
+-- record is performed atomically and other threads accessing the same
+-- record are blocked.  To avoid deadlock, any explicit database
+-- operation must not be performed in this function. Throws a
+-- 'KcException' on failure.
 kccuraccept :: KcCur
             -> KcVisitFull
             -> Bool -- ^ writable
@@ -1266,7 +1344,9 @@ kccuraccept cur visitFull writable step = do
 foreign import ccall safe "kclangc.h kccuraccept" _kccuraccept
   :: Ptr KCCUR -> FunPtr KCVISITFULL -> Ptr () -> CInt -> CInt -> IO CInt
 
--- | Remove the current record.
+-- | Remove the current record. If no record corresponds to the key,
+-- false is returned.  The cursor is moved to the next record
+-- implicitly. Throws a 'KcException' on failure.
 kccurremove :: KcCur -> IO ()
 kccurremove cur = do
   withForeignPtr (unKcCur cur) $ \c_cur -> do
@@ -1285,7 +1365,7 @@ kccurgetkey cur step = do
   withForeignPtr (unKcCur cur) $ \c_cur -> do
     alloca $ \ptr -> do
       cstr <- _kccurgetkey c_cur ptr (if step then 1 else 0)
-      bsOfCString cstr ptr
+      allocFreedBsOfCstrLen cstr ptr
 
 foreign import ccall safe "kclangc.h kccurgetkey" _kccurgetkey
   :: Ptr KCCUR -> Ptr CSize -> CInt -> IO CString
@@ -1298,14 +1378,15 @@ kccurgetvalue cur step = do
   withForeignPtr (unKcCur cur) $ \c_cur -> do
     alloca $ \ptr -> do
       cstr <- _kccurgetvalue c_cur ptr (if step then 1 else 0)
-      bsOfCString cstr ptr
+      allocFreedBsOfCstrLen cstr ptr
 
 foreign import ccall safe "kclangc.h kccurgetvalue" _kccurgetvalue
   :: Ptr KCCUR -> Ptr CSize -> CInt -> IO CString
 
 -- | Get a pair of the key and the value of the current record.
 kccurget :: KcCur
-         -> Bool -- ^ step
+         -> Bool -- ^ 'step' - @True@ to move the cursor to the next
+                 -- record, or @False@ for no move
          -> IO (Maybe (BS.ByteString, BS.ByteString))
 kccurget cur step = do
   withForeignPtr (unKcCur cur) $ \c_cur -> do
@@ -1313,18 +1394,18 @@ kccurget cur step = do
       alloca $ \vbp -> do
         alloca $ \vsp -> do
           cstr <- _kccurget c_cur ksp vbp vsp (if step then 1 else 0)
-          maybeKey <- bsOfCString cstr ksp
+          maybeKey <- allocFreedBsOfCstrLen cstr ksp
           case maybeKey of
             Just key -> do vb <- peek vbp
-                           vs <- peek vsp
-                           val <- BS.packCStringLen (vb, fromIntegral vs)
-                           return $ Just (key, val)
+                           maybeVal <- allocFreedBsOfCstrLen vb vsp
+                           return $ maybe Nothing (\v -> Just (key, v)) maybeVal
             Nothing -> return Nothing
 
 foreign import ccall safe "kclangc.h kccurget" _kccurget
   :: Ptr KCCUR -> Ptr CSize -> Ptr CString -> Ptr CSize -> CInt -> IO CString
 
--- | Jump the cursor to the first record for forward scan.
+-- | Jump the cursor to the first record for forward scan. Throws a
+-- 'KcException' on failure.
 kccurjump :: KcCur -> IO ()
 kccurjump cur =
   withForeignPtr (unKcCur cur) $ \c_cur -> do
@@ -1335,7 +1416,7 @@ kccurjump cur =
 foreign import ccall safe "kclangc.h kccurjump" _kccurjump
   :: Ptr KCCUR -> IO CInt
 
--- | Jump the cursor to a record for forward scan.
+-- | Jump the cursor to a record for forward scan. Throws a 'KcException' on failure.
 kccurjumpkey :: KcCur -> BS.ByteString -> IO ()
 kccurjumpkey cur key =
   withForeignPtr (unKcCur cur) $ \c_cur -> do
@@ -1347,7 +1428,10 @@ kccurjumpkey cur key =
 foreign import ccall safe "kclangc.h kccurjumpkey" _kccurjumpkey
   :: Ptr KCCUR -> CString -> CSize -> IO CInt
 
--- | Jump the cursor to the last record for backward scan.
+-- | Jump the cursor to the last record for backward scan. This method
+-- is dedicated to tree databases.  Some database types, especially
+-- hash databases, may provide a dummy implementation. Throws a
+-- 'KcException' on failure.
 kccurjumpback :: KcCur -> IO ()
 kccurjumpback cur =
   withForeignPtr (unKcCur cur) $ \c_cur -> do
@@ -1358,7 +1442,10 @@ kccurjumpback cur =
 foreign import ccall safe "kclangc.h kccurjumpback" _kccurjumpback
   :: Ptr KCCUR -> IO CInt
 
--- | Jump the cursor to a record for backward scan.
+-- | Jump the cursor to a record for backward scan. This method is
+-- dedicated to tree databases.  Some database types, especially hash
+-- databases, will provide a dummy implementation. Throws a
+-- 'KcException' on failure.
 kccurjumpbackkey :: KcCur -> BS.ByteString -> IO ()
 kccurjumpbackkey cur key =
   withForeignPtr (unKcCur cur) $ \c_cur -> do
@@ -1370,7 +1457,7 @@ kccurjumpbackkey cur key =
 foreign import ccall safe "kclangc.h kccurjumpbackkey" _kccurjumpbackkey
   :: Ptr KCCUR -> CString -> CSize -> IO CInt
 
--- | Step the cursor to the next record.
+-- | Step the cursor to the next record. Throws a 'KcException' on failure.
 kccurstep :: KcCur -> IO ()
 kccurstep cur =
   withForeignPtr (unKcCur cur) $ \c_cur -> do
@@ -1381,7 +1468,9 @@ kccurstep cur =
 foreign import ccall safe "kclangc.h kccurstep" _kccurstep
   :: Ptr KCCUR -> IO CInt
 
--- | Step the cursor to the previous record.
+-- | Step the cursor to the previous record. This method is dedicated
+-- to tree databases.  Some database types, especially hash databases,
+-- may provide a dummy implementation. Throws a 'KcException' on failure.
 kccurstepback :: KcCur -> IO ()
 kccurstepback cur =
   withForeignPtr (unKcCur cur) $ \c_cur -> do
@@ -1428,7 +1517,9 @@ foreign import ccall unsafe "kclangc.h kccuremsg" _kccuremsg
 newtype KcMap = KcMap { unKcMap :: ForeignPtr KCMAP } deriving (Eq)
 data KCMAP      -- native type
 
--- | Create a string hash map object.
+-- | Create a string hash map object. The object of the return value
+-- should be released with the kcmapdel function when it is no longer
+-- in use.
 kcmapnew :: Int -- ^ the number of buckets of the hash table. If it is
                 -- not more than 0, the default setting 31 is specified.
          -> IO KcMap
@@ -1467,7 +1558,7 @@ foreign import ccall unsafe "kclangc.h kcmapset" _kcmapset
 
 -- | Add a record. If no record corresponds to the key, a new record
 -- is created.  If the corresponding record exists, the record is not
--- modified and false is returned.
+-- modified and a 'KcException' is thrown.
 kcmapadd :: KcMap
          -> BS.ByteString -- ^ key
          -> BS.ByteString -- ^ value
@@ -1483,7 +1574,7 @@ foreign import ccall safe "kclangc.h kcmapadd" _kcmapadd
   :: Ptr KCMAP -> CString -> CSize -> CString -> CSize -> IO CInt
 
 -- | Replace the value of a record. If no record corresponds to the
--- key, no new record is created and false is returned. If the
+-- key, no new record is created and a 'KcException' is thrown. If the
 -- corresponding record exists, the value is modified.
 kcmapreplace :: KcMap
              -> BS.ByteString -- ^ key
@@ -1509,13 +1600,14 @@ kcmapappend :: KcMap
 kcmapappend m key val =
   withForeignPtr (unKcMap m) $ \c_map -> do
     BS.unsafeUseAsCStringLen key $ \(kbuf, ksiz) ->
-      BS.unsafeUseAsCStringLen val $ \(vbuf, vsiz) ->
+      BS.unsafeUseAsCStringLen val $ \(vbuf, vsiz) -> do
         _kcmapappend c_map kbuf (fromIntegral ksiz) vbuf (fromIntegral vsiz)
 
 foreign import ccall safe "kclangc.h kcmapappend" _kcmapappend
   :: Ptr KCMAP -> CString -> CSize -> CString -> CSize -> IO ()
 
--- | Remove a record. If no record corresponds to the key, false is returned.
+-- | Remove a record. If no record corresponds to the key, a
+-- 'KcException' is thrown.
 kcmapremove :: KcMap
             -> BS.ByteString -- ^ key
             -> IO ()
@@ -1537,12 +1629,12 @@ kcmapget m key =
     BS.unsafeUseAsCStringLen key $ \(kbuf, ksiz) -> do
       alloca $ \ptr -> do
         cstr <- _kcmapget c_map kbuf (fromIntegral ksiz) ptr
-        bsOfCString cstr ptr
+        allocCopiedBsOfCstrLen cstr ptr
 
 foreign import ccall safe "kclangc.h kcmapget" _kcmapget
   :: Ptr KCMAP -> CString -> CSize -> Ptr CSize -> IO CString
 
--- | Remove all records.
+-- | Remove all records. Throws a 'KcException' on failure.
 kcmapclear :: KcMap -> IO ()
 kcmapclear m =
   withForeignPtr (unKcMap m) $ \c_map -> do
@@ -1565,7 +1657,11 @@ foreign import ccall safe "kclangc.h kcmapcount" _kcmapcount
 --------------------------------------------------------------------------------
 -- KcMapIter
 
--- | Iterator of memory-saving string hash map.
+-- | Iterator of memory-saving string hash map. The object of the
+-- return value should be released with the kcmapiterdel function when
+-- it is no longer in use. This object will not be invalidated even
+-- when the map object is updated once. However, phantom records may
+-- be retrieved if they are removed after creation of each iterator.
 newtype KcMapIter = KcMapIter { unKcMapIter :: ForeignPtr KCMAPITER } deriving (Eq)
 data KCMAPITER      -- native type
 
@@ -1623,12 +1719,11 @@ kcmapiterget mi = do
       alloca $ \vbp -> do
         alloca $ \vsp -> do
           cstr <- _kcmapiterget c_mi ksp vbp vsp
-          maybeKey <- bsOfCString cstr ksp
+          maybeKey <- allocCopiedBsOfCstrLen cstr ksp
           case maybeKey of
             Just key -> do vb <- peek vbp
-                           vs <- peek vsp
-                           val <- BS.packCStringLen (vb, fromIntegral vs)
-                           return $ Just (key, val)
+                           maybeVal <- allocCopiedBsOfCstrLen vb vsp
+                           return $ maybe Nothing (\v -> Just (key, v)) maybeVal
             Nothing -> return Nothing
 
 foreign import ccall safe "kclangc.h kcmapiterget" _kcmapiterget
@@ -1644,7 +1739,11 @@ foreign import ccall safe "kclangc.h kcmapiterstep" _kcmapiterstep
 --------------------------------------------------------------------------------
 -- KcMapSort
 
--- | Sorter of memory-saving string hash map.
+-- | Sorter of memory-saving string hash map. The object of the return
+-- value should be released with the kcmapsortdel function when it is
+-- no longer in use. This object will not be invalidated even when the
+-- map object is updated once. However, phantom records may be
+-- retrieved if they are removed after creation of each sorter.
 newtype KcMapSort = KcMapSort { unKcMapSort :: ForeignPtr KCMAPSORT } deriving (Eq)
 data KCMAPSORT      -- native type
 
@@ -1674,7 +1773,7 @@ kcmapsortgetkey ms =
   withForeignPtr (unKcMapSort ms) $ \c_ms -> do
     alloca $ \spp -> do
       cstr <- _kcmapsortgetkey c_ms spp
-      bsOfCString cstr spp
+      allocCopiedBsOfCstrLen cstr spp
 
 foreign import ccall safe "kclangc.h kcmapsortgetkey" _kcmapsortgetkey
   :: Ptr KCMAPSORT -> Ptr CSize -> IO CString
@@ -1685,7 +1784,7 @@ kcmapsortgetvalue ms =
   withForeignPtr (unKcMapSort ms) $ \c_ms -> do
     alloca $ \spp -> do
       cstr <- _kcmapsortgetvalue c_ms spp
-      bsOfCString cstr spp
+      allocCopiedBsOfCstrLen cstr spp
 
 foreign import ccall safe "kclangc.h kcmapsortgetvalue" _kcmapsortgetvalue
   :: Ptr KCMAPSORT -> Ptr CSize -> IO CString
@@ -1698,12 +1797,11 @@ kcmapsortget ms = do
       alloca $ \vbp -> do
         alloca $ \vsp -> do
           cstr <- _kcmapsortget c_ms ksp vbp vsp
-          maybeKey <- bsOfCString cstr ksp
+          maybeKey <- allocCopiedBsOfCstrLen cstr ksp
           case maybeKey of
             Just key -> do vb <- peek vbp
-                           vs <- peek vsp
-                           val <- BS.packCStringLen (vb, fromIntegral vs)
-                           return $ Just (key, val)
+                           maybeVal <- allocCopiedBsOfCstrLen vb vsp
+                           return $ maybe Nothing (\v -> Just (key, v)) maybeVal
             Nothing -> return Nothing
 
 foreign import ccall safe "kclangc.h kcmapsortget" _kcmapsortget

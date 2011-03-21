@@ -1687,31 +1687,32 @@ kcmapiterdel mi = withForeignPtr (unKcMapIter mi) _kcmapiterdel
 foreign import ccall safe "kclangc.h kcmapiterdel" _kcmapiterdel
   :: Ptr KCMAPITER -> IO ()
 
--- | Get the key of the current record. Throws a 'KcException' on failure.
-kcmapitergetkey :: KcMapIter -> Int -> IO BS.ByteString
+-- | Get the key of the current record.
+kcmapitergetkey :: KcMapIter -> Int -> IO (Maybe BS.ByteString)
 kcmapitergetkey mi sz = do
   withForeignPtr (unKcMapIter mi) $ \c_mi -> do
     cstr <- _kcmapitergetkey c_mi (fromIntegral sz)
-    if cstr == nullPtr then throwIO (KcException "kcmapitergetkey" KCEINVALID "")
-      else BS.packCString cstr
+    if cstr == nullPtr then return Nothing
+      else do bs <- BS.packCString cstr
+              return $ Just bs
 
 foreign import ccall safe "kclangc.h kcmapitergetkey" _kcmapitergetkey
   :: Ptr KCMAPITER -> CSize -> IO CString
 
--- | Get the value of the current record. Throws a 'KcException' on failure.
-kcmapitergetvalue :: KcMapIter -> Int -> IO BS.ByteString
+-- | Get the value of the current record.
+kcmapitergetvalue :: KcMapIter -> Int -> IO (Maybe BS.ByteString)
 kcmapitergetvalue mi sz = do
   withForeignPtr (unKcMapIter mi) $ \c_mi -> do
     cstr <- _kcmapitergetvalue c_mi (fromIntegral sz)
-    if cstr == nullPtr then throwIO (KcException "kcmapitergetvalue" KCEINVALID "")
-      else do BS.packCString cstr
+    if cstr == nullPtr then return Nothing
+      else do bs <- BS.packCString cstr
+              return $ Just bs
 
 foreign import ccall safe "kclangc.h kcmapitergetvalue" _kcmapitergetvalue
   :: Ptr KCMAPITER -> CSize -> IO CString
 
 -- | Get a pair of the key and the value of the current record.
--- Throws a 'KcException' on failure.
-kcmapiterget :: KcMapIter -> IO (BS.ByteString, BS.ByteString)
+kcmapiterget :: KcMapIter -> IO (Maybe (BS.ByteString, BS.ByteString))
 kcmapiterget mi = do
   withForeignPtr (unKcMapIter mi) $ \c_mi -> do
     alloca $ \ksp -> do
@@ -1720,13 +1721,10 @@ kcmapiterget mi = do
           cstr <- _kcmapiterget c_mi ksp vbp vsp
           maybeKey <- allocCopiedBsOfCstrLen cstr ksp
           case maybeKey of
-            Just key -> do
-              vb <- peek vbp
-              maybeVal <- allocCopiedBsOfCstrLen vb vsp
-              case maybeVal of
-                Just val -> return (key, val)
-                Nothing -> throwIO (KcException "kcmapiterget" KCEINVALID "")
-            Nothing -> throwIO (KcException "kcmapiterget" KCEINVALID "")
+            Just key -> do vb <- peek vbp
+                           maybeVal <- allocCopiedBsOfCstrLen vb vsp
+                           return $ maybe Nothing (\v -> Just (key, v)) maybeVal
+            Nothing -> return Nothing
 
 foreign import ccall safe "kclangc.h kcmapiterget" _kcmapiterget
   :: Ptr KCMAPITER -> Ptr CSize -> Ptr CString -> Ptr CSize -> IO CString
